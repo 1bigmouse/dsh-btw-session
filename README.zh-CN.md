@@ -19,6 +19,10 @@
 dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session
 ```
 
+`<profile>` 换成你启动 DSH 时使用的 profile 名：桌面版是 `desktop`，CLI 用户填
+`dsh --profile` 后面的名字。桌面版也可以直接在 **插件 → 添加插件** 中粘贴上面的
+仓库地址，无需命令行。
+
 想固定到具体某个提交，在地址后面加上提交号：
 
 ```sh

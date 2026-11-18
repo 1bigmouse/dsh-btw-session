@@ -25,6 +25,10 @@ Install straight from GitHub:
 dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session
 ```
 
+`<profile>` is the name of the DSH profile you launch: `desktop` for the Desktop
+app, or the name after `dsh --profile` for the CLI. In Desktop you can instead
+paste the same address into **Plugins → Add plugin** and skip the command line.
+
 To pin the exact source you reviewed, append the commit:
 
 ```sh
