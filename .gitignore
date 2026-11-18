@@ -1,0 +1,15 @@
+# Dependencies (pnpm/npm never runs for this package, but links may appear)
+node_modules/
+
+# Packed artifacts
+*.tgz
+*.tar.gz
+
+# Local environment and editor noise
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

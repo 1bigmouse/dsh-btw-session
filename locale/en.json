@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Btw side session",
+    "description": "Answers quick side questions in the right sidebar from the current conversation without adding them to this session's context, reports the side thread's token usage separately, and keeps nothing after you close it."
+  }
+}

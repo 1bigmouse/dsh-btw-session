@@ -1,0 +1,56 @@
+{
+  "name": "dsh-btw-session",
+  "version": "0.1.0",
+  "description": "Ephemeral side questions in the right sidebar: answered from the current conversation, counted separately, and discarded on close.",
+  "type": "module",
+  "license": "MIT",
+  "author": "1bigmouse",
+  "homepage": "https://github.com/1bigmouse/dsh-btw-session#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1bigmouse/dsh-btw-session.git"
+  },
+  "bugs": {
+    "url": "https://github.com/1bigmouse/dsh-btw-session/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "harness",
+    "btw",
+    "side-question",
+    "side-session",
+    "ephemeral",
+    "right-sidebar"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "tests"
+  ],
+  "scripts": {
+    "test": "node tests/verify.mjs"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

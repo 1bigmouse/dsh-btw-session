@@ -1,0 +1,17 @@
+# Btw side session: one Host row that registers the side-question service,
+# the `/btw` command, and the three Fetch routes the right-sidebar panel uses.
+- insert:
+    - id: btw-session
+      name: 'dsh-btw-session'
+      config:
+        maxExchanges: 20
+        maxContextMessages: 80
+        maxContextChars: 48000
+        maxOutputTokens: 8192
+        # Read-only lookups a side answer may run. Remove the list to answer from
+        # context alone; mutating tools are never offered.
+        tools:
+          - read
+          - glob
+          - grep
+        maxToolRounds: 4
