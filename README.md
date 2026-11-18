@@ -227,6 +227,11 @@ registration (tab type, guide entry, panel body, command row, close handler).
 No network access and no DSH installation are needed, so the same command runs
 in GitHub Actions on Node 22 and 24.
 
+## Community
+
+Announced and discussed in DeepSeek Harness Discussions:
+https://github.com/deepseek-ai/deepseek-harness/discussions/13685
+
 ## License
 
 [MIT](./LICENSE) © 2026 1bigmouse

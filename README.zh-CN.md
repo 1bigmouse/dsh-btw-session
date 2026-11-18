@@ -101,6 +101,11 @@ npm test          # 或：node tests/verify.mjs
 不需要联网，也不需要安装 DSH，因此同一命令可在 GitHub Actions 的 Node 22 与 24
 上运行。
 
+## 社区
+
+插件介绍与讨论帖（DeepSeek Harness Discussions）：
+https://github.com/deepseek-ai/deepseek-harness/discussions/13685
+
 ## 许可证
 
 [MIT](./LICENSE) © 2026 1bigmouse
