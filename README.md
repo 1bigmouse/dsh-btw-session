@@ -15,11 +15,24 @@ asked from.
 
 ## Install
 
+**Compatibility:** built and tested on **DSH 0.2.2-rc.3** (Desktop and CLI).
+Older releases are untested and may lack the right-sidebar tab slots this bundle
+registers.
+
+Install straight from GitHub:
+
 ```sh
 dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session
 ```
 
-Or keep a checkout and link it:
+To pin the exact source you reviewed, append the commit:
+
+```sh
+dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session#<sha>
+```
+
+Or clone it and install the checkout as a local directory — in Desktop,
+**Plugins → Add plugin** accepts the cloned directory too:
 
 ```sh
 git clone https://github.com/1bigmouse/dsh-btw-session
@@ -27,13 +40,7 @@ dsh plugin --profile <profile> add ./dsh-btw-session
 ```
 
 The package ships plain ESM JavaScript, so there is no build step and no pnpm
-`allowBuilds` entry to approve. Pin a commit
-(`github:1bigmouse/dsh-btw-session#<sha>`) when you want the exact source you
-reviewed. In Desktop, **Plugins → Add plugin** accepts the same checkout
-directory.
-
-Developed and tested against **DSH 0.2.2-rc.3** (Desktop and CLI). Older
-releases may not provide the right-sidebar tab slots this bundle registers.
+`allowBuilds` approval is involved.
 
 ## Use it
 

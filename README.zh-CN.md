@@ -10,23 +10,31 @@
 
 ## 安装
 
+**兼容性**：在 **DSH 0.2.2-rc.3**（桌面版与 CLI）上验证；更早的版本未做兼容，
+可能缺少本插件注册的右侧边栏标签页插槽。
+
+从 GitHub 直接安装：
+
 ```sh
 dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session
 ```
 
-也可以克隆后以本地目录安装：
+想固定到具体某个提交，在地址后面加上提交号：
+
+```sh
+dsh plugin --profile <profile> add github:1bigmouse/dsh-btw-session#<sha>
+```
+
+也可以克隆仓库后按本地目录安装（桌面版可在 **插件 → 添加插件** 中选择克隆下来的
+目录）：
 
 ```sh
 git clone https://github.com/1bigmouse/dsh-btw-session
 dsh plugin --profile <profile> add ./dsh-btw-session
 ```
 
-包内是纯 ESM JavaScript，没有构建步骤，也不需要为 pnpm 的 `allowBuilds` 授权。
-想固定源码版本时使用 `github:1bigmouse/dsh-btw-session#<sha>` 指定提交。桌面版
-也可以在 **插件 → 添加插件** 中选择这个目录。
-
-开发与验证环境是 **DSH 0.2.2-rc.3**（桌面版与 CLI）。更早的版本可能没有本插件
-注册所使用的右侧边栏标签页插槽。
+这个包是纯 ESM JavaScript，安装后不需要构建，也不涉及 pnpm 的 `allowBuilds`
+授权。
 
 ## 使用
 
