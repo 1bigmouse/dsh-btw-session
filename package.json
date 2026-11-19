@@ -1,7 +1,7 @@
 {
   "name": "dsh-btw-session",
-  "version": "0.1.0",
-  "description": "Ephemeral side questions in the right sidebar: answered from the current conversation, counted separately, and discarded on close.",
+  "version": "0.3.0",
+  "description": "Ephemeral side questions in the right sidebar: answered from the current conversation and its screenshots, retryable on failure, counted separately, and discarded on close.",
   "type": "module",
   "license": "MIT",
   "author": "1bigmouse",

@@ -29,7 +29,12 @@ window.__ModuleLoader__.load({
 
     const STATE_PATH = '/api/btw/state'
     const ASK_PATH = '/api/btw/ask'
+    const RETRY_PATH = '/api/btw/retry'
     const CLOSE_PATH = '/api/btw/close'
+    /** Serves one admitted image back to the panel that asked about it. */
+    const IMAGE_PATH = '/api/btw/image'
+    /** The raster formats the Host admits; the file input offers the same list. */
+    const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
     /** The panel mirrors Host state; one side answer is one request, so polling is cheap. */
     const POLL_MS = 1500
 
@@ -39,14 +44,21 @@ window.__ModuleLoader__.load({
       guideTitle: 'Btw side session',
       guideDescription: 'Ask about this conversation without adding to it',
       commandOpened: 'Side question sent to the Btw panel',
+      openPanel: 'Open panel',
       header: 'Btw side session',
       headerHint: 'Answers here stay out of this conversation',
       empty: 'Ask anything about this conversation. The answer is built from what is already here, may look up workspace files read-only, and is never added back to this session.',
-      emptyMarkup: 'The model wrote its tool call as text; it was ignored, so this answer used the conversation only.',
+      emptyMarkup: 'The model wrote a tool call as text instead of answering; that markup was ignored.',
       emptyTruncated: 'The answer was cut off at the output limit before any prose arrived — raise maxOutputTokens.',
+      emptyToolBudget: 'The tool rounds ran out after {reads} lookups, and the closing pass returned no text either.',
       emptyError: 'The model call failed before any text was returned.',
       emptyAborted: 'The request was cancelled.',
       emptyNoText: 'The model returned no text for this question.',
+      retry: 'Retry',
+      retrying: 'Retrying…',
+      failureTimeout: 'The model did not finish in time.',
+      failureInterrupted: 'The request was cancelled.',
+      failureError: 'The model call failed.',
       placeholder: 'Ask a side question…',
       send: 'Ask',
       sending: 'Answering…',
@@ -71,7 +83,14 @@ window.__ModuleLoader__.load({
       reads: '{count} reads',
       toolList: 'Tools',
       toolOff: 'off',
+      toolOffDisabled: 'off (empty whitelist)',
+      toolOffNoRegistry: 'off (no tool service)',
+      toolOffNotAdmitted: 'off (not granted to this session)',
+      toolOffUncloneable: 'off (schema not serializable)',
+      toolOffIdle: 'not used yet',
       toolMarkupNote: 'tool call came back as text',
+      budgetWarn: 'read budget hit',
+      budgetWarnTitle: 'The tool rounds ran out before this answer: it is based on what had been read by then. Raise maxToolRounds for a deeper look.',
       noContext: 'no context sent',
       expand: 'Show usage detail',
       collapse: 'Hide usage detail',
@@ -83,9 +102,19 @@ window.__ModuleLoader__.load({
       copy: 'Copy',
       copied: 'Copied',
       copyAnswer: 'Copy the answer',
+      attach: 'Attach image',
+      attachHint: 'Attach a screenshot, or paste one into the box',
+      imagesOnly: 'Only PNG, JPEG, WebP, or GIF images can be attached.',
+      imageLimit: 'At most {count} images per question.',
+      imageReading: 'Reading the image…',
+      imageFailed: 'could not be read',
+      imageRemove: 'Remove this image',
+      imageCount: 'Images',
       replay: 'replay',
       contextLimit: 'context',
       chars: 'chars',
+      limitsLine: 'replay ≤{replay} turns · context ≤{context} msgs',
+      limitsHint: 'Every answer is built from the last {context} messages of this conversation (older ones drop off past {chars} characters) plus the last {replay} questions and answers of this panel.',
     }
 
     const ZH = {
@@ -93,14 +122,21 @@ window.__ModuleLoader__.load({
       guideTitle: '临时会话（/btw）',
       guideDescription: '就当前会话提问，且不写回会话上下文',
       commandOpened: '问题已发送到「临时会话」面板',
+      openPanel: '打开面板',
       header: '临时会话',
       headerHint: '这里的回答不会进入当前会话',
       empty: '可以问任何关于本次会话的问题。回答基于当前已有上下文，必要时会以只读方式查看工作区文件，且不会写回本会话。',
-      emptyMarkup: '模型把工具调用写成了正文，已忽略；这条回答只用了上下文。',
+      emptyMarkup: '模型把工具调用写成了正文，没有给出回答（那部分标记已忽略）。',
       emptyTruncated: '还没输出正文就撞到了输出上限 —— 可以调大 maxOutputTokens。',
+      emptyToolBudget: '工具轮数用尽（已读取 {reads} 次），补答那次也没有正文。',
       emptyError: '模型调用在返回正文前就失败了。',
       emptyAborted: '请求已取消。',
       emptyNoText: '模型这次没有返回正文。',
+      retry: '重试',
+      retrying: '正在重试…',
+      failureTimeout: '模型没有在时限内完成。',
+      failureInterrupted: '请求已取消。',
+      failureError: '模型调用失败。',
       placeholder: '输入一个临时问题…',
       send: '提问',
       sending: '正在回答…',
@@ -125,7 +161,14 @@ window.__ModuleLoader__.load({
       reads: '读取 {count} 次',
       toolList: '工具',
       toolOff: '未启用',
+      toolOffDisabled: '未启用（白名单为空）',
+      toolOffNoRegistry: '未启用（没有工具服务）',
+      toolOffNotAdmitted: '未启用（本会话未授予）',
+      toolOffUncloneable: '未启用（参数不可序列化）',
+      toolOffIdle: '尚未使用',
       toolMarkupNote: '工具调用未生效',
+      budgetWarn: '读取轮数用尽',
+      budgetWarnTitle: '工具轮数在成文前用尽，这条回答只基于已读到的内容。想读得更深可以调大 maxToolRounds。',
       noContext: '未带上上下文',
       expand: '展开用量明细',
       collapse: '收起用量明细',
@@ -137,9 +180,19 @@ window.__ModuleLoader__.load({
       copy: '复制',
       copied: '已复制',
       copyAnswer: '复制这条回答',
+      attach: '附加图片',
+      attachHint: '附加一张截图，也可以直接粘贴或拖进来',
+      imagesOnly: '只能附加 PNG、JPEG、WebP、GIF 格式的图片。',
+      imageLimit: '每个问题最多 {count} 张图片。',
+      imageReading: '正在读取图片…',
+      imageFailed: '读取失败',
+      imageRemove: '移除这张图',
+      imageCount: '随请求的图片',
       replay: '重放',
       contextLimit: '上下文',
       chars: '字符',
+      limitsLine: '重放 ≤{replay} 轮 · 上下文 ≤{context} 条',
+      limitsHint: '每条回答都基于：本会话最近 {context} 条消息（超过 {chars} 字符时从最早的消息丢起）+ 本面板最近 {replay} 轮问答。',
     }
 
     /** Compact token counts for a narrow column. */
@@ -171,6 +224,124 @@ window.__ModuleLoader__.load({
       const payload = await response.json().catch(() => null)
       if (payload === null) throw new Error('empty response')
       return payload
+    }
+
+    // --------------------------------------------------------------- images
+
+    /**
+     * Read one picked image into canonical base64 and a preview URL.
+     *
+     * The bytes travel in the ask body and the Host stores them through the same
+     * admission gate an ordinary prompt uses, so this side only has to move
+     * bytes; it never decides whether the image is acceptable.
+     * @param file - the browser `File` behind the file input, paste, or drop.
+     * @returns `data` for the request and `dataUrl` for the chip preview.
+     */
+    function readImageFile(file) {
+      return new Promise((resolve, reject) => {
+        if (typeof globalThis.FileReader !== 'function') {
+          reject(new Error('This browser cannot read local files.'))
+          return
+        }
+        const reader = new globalThis.FileReader()
+        reader.onerror = () => { reject(reader.error ?? new Error('The image could not be read.')) }
+        reader.onload = () => {
+          const url = typeof reader.result === 'string' ? reader.result : ''
+          const comma = url.indexOf(',')
+          if (comma < 0) {
+            reject(new Error('The image could not be read.'))
+            return
+          }
+          resolve({ data: url.slice(comma + 1), dataUrl: url })
+        }
+        reader.readAsDataURL(file)
+      })
+    }
+
+    /**
+     * The Host route that serves one admitted image back to this panel.
+     *
+     * The thread keeps durable references, not bytes, so a reloaded panel still
+     * draws the picture it asked about. The route only answers for references
+     * this thread already admitted.
+     */
+    function imageUrl(sessionId, ref) {
+      const id = typeof ref?.attachmentId === 'string' ? ref.attachmentId : ''
+      if (id === '' || typeof sessionId !== 'string' || sessionId === '') return ''
+      return `${IMAGE_PATH}?session=${encodeURIComponent(sessionId)}&attachment=${encodeURIComponent(id)}`
+    }
+
+    /** The `images` member of one ask request, from the chips that finished reading. */
+    function imageParts(items) {
+      const parts = []
+      for (const item of items ?? []) {
+        if (item?.status !== 'ready' || typeof item.data !== 'string' || item.data === '') continue
+        parts.push({
+          mediaType: item.mediaType,
+          data: item.data,
+          ...(typeof item.name === 'string' && item.name !== '' ? { name: item.name } : {}),
+        })
+      }
+      return parts
+    }
+    /**
+     * Decide which picked files the next question may carry.
+     *
+     * The side question has no file drafts — only rasters it can show the model
+     * directly — so anything else is dropped here rather than failing at the Host.
+     * @param fileList - what the picker, a paste, or a drop offered.
+     * @param room - image slots left under the Host's cap.
+     * @returns the images to read plus the copy key to complain with, if any.
+     */
+    function pickImages(fileList, room) {
+      const picked = Array.from(fileList ?? [])
+      const files = picked.filter(file => IMAGE_TYPES.includes(file?.type))
+      if (files.length === 0) return { files: [], refusal: picked.length === 0 ? null : 'imagesOnly' }
+      if (room <= 0) return { files: [], refusal: 'imageLimit' }
+      return { files: files.slice(0, room), refusal: files.length > room ? 'imageLimit' : null }
+    }
+
+    /** The model reading for the header chip, without a provider prefix the id repeats. */
+    function routeLabel(route) {
+      if (route === null || route === undefined) return null
+      const model = String(route.model ?? '')
+      if (model === '') return null
+      const provider = typeof route.provider === 'string' ? route.provider : ''
+      const prefix = `${provider}/`
+      return provider !== '' && model.startsWith(prefix) && model.length > prefix.length
+        ? model.slice(prefix.length)
+        : model
+    }
+
+    /** The full route for the chip's tooltip; the chip itself may be ellipsized. */
+    function routeTitle(route) {
+      if (route === null || route === undefined) return null
+      const model = String(route.model ?? '')
+      const provider = typeof route.provider === 'string' ? route.provider : ''
+      if (model === '') return provider === '' ? null : provider
+      return provider === '' || model.startsWith(`${provider}/`) ? model : `${provider} / ${model}`
+    }
+
+    /** The footer's budget line: what each answer is actually assembled from. */
+    function limitsLine(limits, t) {
+      return t('limitsLine', {
+        replay: countOf(limits?.maxExchanges),
+        context: countOf(limits?.maxContextMessages),
+      })
+    }
+
+    /** The same numbers spelled out, for the footer's tooltip. */
+    function limitsHint(limits, t) {
+      return t('limitsHint', {
+        replay: countOf(limits?.maxExchanges),
+        context: countOf(limits?.maxContextMessages),
+        chars: countOf(limits?.maxContextChars),
+      })
+    }
+
+    /** A non-negative integer from a Host-supplied number. */
+    function countOf(value) {
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
     }
 
     // ------------------------------------------------------------ markdown
@@ -759,6 +930,14 @@ window.__ModuleLoader__.load({
       }, h('path', { d: 'M3.6 5.6 7 9l3.4-3.4' }))
     }
 
+    /** A paperclip glyph for the attach control. */
+    function ClipIcon() {
+      return h('svg', {
+        viewBox: '0 0 14 14', width: 14, height: 14, fill: 'none', stroke: 'currentColor',
+        strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+      }, h('path', { d: 'M5.1 7.6 8.4 4.3a1.9 1.9 0 0 1 2.7 2.7l-4 4a3.1 3.1 0 0 1-4.4-4.4l4.2-4.2' }))
+    }
+
     /** One decimal below ten, whole numbers above, so a narrow pill stays stable. */
     function fmtRate(value) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null
@@ -804,7 +983,21 @@ window.__ModuleLoader__.load({
         ttftMs,
         tps: output > 0 ? output / (decodeMs / 1000) : null,
         contextChars: number(totals?.contextChars),
+        images: number(totals?.images),
       }
+    }
+
+    /** Which read-only tools this thread is using, or why it has none. */
+    function toolReading(tools, t) {
+      if (Array.isArray(tools?.names) && tools.names.length > 0) return tools.names.join(', ')
+      const key = {
+        'disabled': 'toolOffDisabled',
+        'no-registry': 'toolOffNoRegistry',
+        'not-admitted': 'toolOffNotAdmitted',
+        'uncloneable': 'toolOffUncloneable',
+        'idle': 'toolOffIdle',
+      }[tools?.reason]
+      return t(key ?? 'toolOff')
     }
 
     /** One pill: a glyph plus one or two readings joined by a separator glyph. */
@@ -848,9 +1041,8 @@ window.__ModuleLoader__.load({
       add(t('latency'), fmtMs(summary.llmMs))
       add(t('firstToken'), fmtMs(summary.ttftMs / summary.asks))
       add(t('context'), `${fmtTokens(summary.contextChars)} ${t('chars')}`)
-      add(t('toolList'), Array.isArray(tools?.names) && tools.names.length > 0
-        ? tools.names.join(', ')
-        : t('toolOff'))
+      if (summary.images !== 0) add(t('imageCount'), String(summary.images))
+      add(t('toolList'), toolReading(tools, t))
 
       return h('section', { className: 'btw-usage' }, [
         h('button', {
@@ -883,20 +1075,70 @@ window.__ModuleLoader__.load({
     /** Why an answer carries no text, phrased for the reader. */
     function emptyReason(metrics, t) {
       if (metrics?.toolMarkup === true) return t('emptyMarkup')
+      // The tool rounds ran out and the closing, tool-free pass had nothing to say.
+      if (metrics?.toolBudgetExhausted === true) {
+        return t('emptyToolBudget', { reads: typeof metrics.toolCalls === 'number' ? metrics.toolCalls : 0 })
+      }
       // The provider said it wanted tools but no call block arrived: the same
       // desync that produces markup in the prose.
-      if (metrics?.finish === 'tool-calls') return t('emptyMarkup')
+      if (metrics?.finish === 'tool-calls' && (metrics.toolCalls ?? 0) === 0) return t('emptyMarkup')
       if (metrics?.finish === 'max-tokens') return t('emptyTruncated')
       if (metrics?.finish === 'error') return t('emptyError')
       if (metrics?.finish === 'aborted') return t('emptyAborted')
       return t('emptyNoText')
     }
 
+    /** Why one attempt failed, phrased for the reader. */
+    function failureText(failure, t) {
+      const key = {
+        timeout: 'failureTimeout',
+        interrupted: 'failureInterrupted',
+        error: 'failureError',
+      }[failure?.reason]
+      return t(key ?? 'failureError')
+    }
+
+    /**
+     * One answer body: the answer, or the reason there is none plus a way to
+     * try again.
+     *
+     * A failed attempt is a row the user can act on, not a dead end: the Host
+     * keeps the question, so Retry re-answers the same question rather than
+     * asking the panel to resend anything.
+     */
+    function AnswerBody({ message, t, onRetry }) {
+      const failure = message.failure ?? null
+      if (failure === null && message.text !== '') return h(Markdown, { text: message.text, t })
+      const reason = failure === null ? emptyReason(message.metrics, t) : failureText(failure, t)
+      return h('div', { className: 'btw-failure' }, [
+        h('p', {
+          key: 'reason',
+          className: 'btw-empty-answer',
+          ...(failure?.message === undefined ? {} : { title: String(failure.message) }),
+        }, reason),
+        h('button', {
+          key: 'retry',
+          type: 'button',
+          className: 'btw-retry',
+          onClick: () => { if (typeof onRetry === 'function') onRetry(message.key) },
+        }, t('retry')),
+      ])
+    }
+
     /** One exchange row: the question, or the answer with its own measurement. */
-    function Exchange({ message, t }) {
+    function Exchange({ message, t, sessionId, onRetry }) {
       const isUser = message.role === 'user'
       const [copied, setCopied] = useState(false)
       const metrics = message.metrics
+      // The question's own pictures: durable references, drawn through the Host
+      // route, so a reloaded panel still shows what the answer was looking at.
+      const images = (Array.isArray(message.attachments) ? message.attachments : [])
+        .map((ref, index) => ({
+          key: `${typeof ref?.attachmentId === 'string' ? ref.attachmentId : 'image'}:${index}`,
+          src: imageUrl(sessionId, ref),
+          name: typeof ref?.name === 'string' ? ref.name : '',
+        }))
+        .filter(entry => entry.src !== '')
       const parts = []
       if (!isUser && metrics !== null && metrics !== undefined) {
         parts.push(`${t('input')} ${fmtTokens(metrics.inputTokens)}`)
@@ -921,11 +1163,21 @@ window.__ModuleLoader__.load({
       }
       return h('article', { className: `btw-exchange btw-${isUser ? 'question' : 'answer'}` }, [
         isUser
-          ? h('div', { key: 'body', className: 'btw-question-body' }, message.text)
-          : message.text === ''
-            // A recorded ask with no prose must never look like a silent panel.
-            ? h('p', { key: 'body', className: 'btw-empty-answer' }, emptyReason(metrics, t))
-            : h(Markdown, { key: 'body', text: message.text, t }),
+          ? h('div', {
+            key: 'body',
+            className: images.length === 0 ? 'btw-question-body' : 'btw-question-body btw-question-body-media',
+          }, [
+            images.length === 0 ? null : h('div', { key: 'images', className: 'btw-question-images' },
+              images.map(entry => h('img', {
+                key: entry.key,
+                className: 'btw-question-image',
+                src: entry.src,
+                alt: entry.name,
+                title: entry.name === '' ? t('imageCount') : entry.name,
+              }))),
+            h('span', { key: 'text', className: 'btw-question-text' }, message.text),
+          ])
+          : h(AnswerBody, { key: 'body', message, t, onRetry }),
         isUser
           ? null
           : h('footer', { key: 'meta', className: 'btw-exchange-footer' }, [
@@ -933,7 +1185,14 @@ window.__ModuleLoader__.load({
             metrics?.toolMarkup === true
               ? h('span', { key: 'w', className: 'btw-warn', title: t('toolMarkupNote') }, t('toolMarkupNote'))
               : null,
-            h('button', {
+            // An answer produced after the tool rounds ran out used less than the
+            // model asked for; the reader deserves to know why it is thinner.
+            metrics?.toolBudgetExhausted === true && message.text !== ''
+              ? h('span', { key: 'b', className: 'btw-warn', title: t('budgetWarnTitle') }, t('budgetWarn'))
+              : null,
+            // Nothing to copy when the row carries a reason instead of an answer;
+            // Retry lives in the body block.
+            message.text === '' ? null : h('button', {
               key: 'copy',
               type: 'button',
               className: 'btw-copy',
@@ -950,9 +1209,14 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState(null)
       const [draft, setDraft] = useState('')
       const [failure, setFailure] = useState(null)
+      /** Images picked for the next question; cleared once the Host accepted it. */
+      const [attached, setAttached] = useState([])
+      /** A local complaint about the pick itself, kept apart from Host failures. */
+      const [notice, setNotice] = useState(null)
       const asking = useRef(false)
       const pendingHandled = useRef(null)
       const scroller = useRef(null)
+      const picker = useRef(null)
 
       let tab
       try {
@@ -975,21 +1239,57 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
-      const ask = useCallback(async (question) => {
+      const ask = useCallback(async (question, images = []) => {
         const text = String(question ?? '').trim()
-        if (text === '' || asking.current) return
+        if (text === '' || asking.current) return false
         asking.current = true
         setFailure(null)
+        setNotice(null)
         setState(previous => (previous === null ? previous : { ...previous, busy: true, pending: null }))
         try {
           const result = await call(ASK_PATH, {
             method: 'POST',
-            body: JSON.stringify({ sessionId: String(sessionId), question: text }),
+            body: JSON.stringify({
+              sessionId: String(sessionId),
+              question: text,
+              ...(images.length === 0 ? {} : { images }),
+            }),
           })
           if (result?.snapshot !== undefined) setState(result.snapshot)
           if (result?.ok === false && result?.error !== undefined) setFailure(result.error.message)
+          return result?.ok !== false
         } catch (error) {
           setFailure(error?.message ?? String(error))
+          return false
+        } finally {
+          asking.current = false
+          void refresh()
+        }
+      }, [sessionId, refresh])
+
+      /**
+       * Answer one failed row again.
+       *
+       * The Host still holds the question, so this only names the row; the panel
+       * never has to resend text or images.
+       */
+      const retry = useCallback(async (key) => {
+        if (typeof key !== 'string' || key === '' || asking.current) return false
+        asking.current = true
+        setFailure(null)
+        setNotice(null)
+        setState(previous => (previous === null ? previous : { ...previous, busy: true }))
+        try {
+          const result = await call(RETRY_PATH, {
+            method: 'POST',
+            body: JSON.stringify({ sessionId: String(sessionId), key }),
+          })
+          if (result?.snapshot !== undefined) setState(result.snapshot)
+          if (result?.ok === false && result?.error !== undefined) setFailure(result.error.message)
+          return result?.ok !== false
+        } catch (error) {
+          setFailure(error?.message ?? String(error))
+          return false
         } finally {
           asking.current = false
           void refresh()
@@ -1000,6 +1300,8 @@ window.__ModuleLoader__.load({
         setState(null)
         setFailure(null)
         setDraft('')
+        setAttached([])
+        setNotice(null)
         pendingHandled.current = null
         void refresh()
         const timer = setInterval(() => { void refresh() }, POLL_MS)
@@ -1022,12 +1324,59 @@ window.__ModuleLoader__.load({
         if (node !== null) node.scrollTop = node.scrollHeight
       }, [count, busy])
 
+      // The Host is the authority on whether images can be stored at all, so the
+      // attach control appears only once its answer is known.
+      const imageMax = countOf(state?.images?.max)
+      const canAttach = state !== null && state?.images?.enabled === true
+
+      const addFiles = useCallback((fileList) => {
+        const room = Math.max(0, imageMax - attached.length)
+        const picked = pickImages(fileList, room)
+        if (picked.refusal !== null) {
+          setNotice(t(picked.refusal, { count: imageMax }))
+          if (picked.files.length === 0) return
+        } else {
+          setNotice(null)
+        }
+        for (const file of picked.files) {
+          const id = `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+          setAttached(list => [...list, {
+            id, name: file.name ?? '', mediaType: file.type, status: 'reading', data: '', dataUrl: '',
+          }])
+          void readImageFile(file).then((record) => {
+            setAttached(list => list.map(item => (item.id === id ? { ...item, ...record, status: 'ready' } : item)))
+          }).catch((error) => {
+            setNotice(error instanceof Error ? error.message : String(error))
+            setAttached(list => list.filter(item => item.id !== id))
+          })
+        }
+      }, [attached.length, imageMax, t])
+
+      const removeImage = useCallback((id) => {
+        setAttached(list => list.filter(item => item.id !== id))
+        setNotice(null)
+      }, [])
+
       const submit = useCallback(() => {
         const text = draft.trim()
-        if (text === '') return
+        if (text === '' || asking.current) return
+        if (attached.some(item => item.status === 'reading')) {
+          setNotice(t('imageReading'))
+          return
+        }
+        const images = imageParts(attached)
         setDraft('')
-        void ask(text)
-      }, [draft, ask])
+        void ask(text, images).then((ok) => {
+          if (ok) {
+            // The Host stores the images it admitted; the draft is consumed.
+            setAttached([])
+            return
+          }
+          // A caller mistake (busy thread, refused image batch) recorded nothing,
+          // so put the text back rather than making the user retype it.
+          setDraft(text)
+        })
+      }, [draft, attached, ask, t])
 
       const closeAndForget = useCallback(() => {
         void call(CLOSE_PATH, {
@@ -1037,6 +1386,8 @@ window.__ModuleLoader__.load({
         }).catch(() => {})
         setState(null)
         setFailure(null)
+        setAttached([])
+        setNotice(null)
         pendingHandled.current = null
         try {
           tab?.actions?.close?.()
@@ -1064,8 +1415,13 @@ window.__ModuleLoader__.load({
             h('span', { key: 'hint', className: 'btw-hint' }, t('headerHint')),
           ]),
           h('div', { key: 'actions', className: 'btw-actions' }, [
-            h('span', { key: 'route', className: 'btw-route', title: t('route') },
-              route === null || route === undefined ? t('noRoute') : String(route.model)),
+            h('span', {
+              key: 'route',
+              className: 'btw-route',
+              // The chip ellipsizes in a narrow column; the tooltip always carries
+              // the whole route so nothing is lost.
+              ...(routeTitle(route) === null ? {} : { title: `${t('route')}: ${routeTitle(route)}` }),
+            }, routeLabel(route) ?? t('noRoute')),
             h('button', {
               key: 'close',
               type: 'button',
@@ -1082,7 +1438,9 @@ window.__ModuleLoader__.load({
             : messages.length === 0
               ? h('p', { key: 'empty', className: 'btw-empty' }, t('empty'))
               : h('div', { key: 'list', className: 'btw-list' },
-                messages.map(message => h(Exchange, { key: message.key, message, t }))),
+                messages.map(message => h(Exchange, {
+                  key: message.key, message, t, sessionId, onRetry: retry,
+                }))),
           busy ? h('div', { key: 'busy', className: 'btw-busy' }, [
             h('span', { key: 'dot', className: 'btw-dot' }),
             h('span', { key: 'text' }, t('sending')),
@@ -1100,31 +1458,107 @@ window.__ModuleLoader__.load({
             key: 'composer',
             className: 'btw-composer',
             onSubmit: (event) => { event.preventDefault(); submit() },
+            onDragOver: (event) => {
+              // Keep a drop aimed at this panel away from the conversation's own
+              // file intake behind it.
+              event.preventDefault()
+              event.stopPropagation()
+            },
+            onDrop: (event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              if (!canAttach) {
+                setNotice(t('imagesOff'))
+                return
+              }
+              addFiles(event.dataTransfer?.files)
+            },
           }, [
-            h('textarea', {
-              key: 'input',
-              className: 'btw-input',
-              value: draft,
-              rows: 2,
-              placeholder: t('placeholder'),
-              disabled: busy,
-              onChange: (event) => { setDraft(event.target.value) },
-              onKeyDown: (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
+            attached.length === 0 ? null : h('div', { key: 'pending', className: 'btw-pending' },
+              attached.map(item => h('div', { key: item.id, className: 'btw-chip' }, [
+                item.dataUrl === ''
+                  ? h('span', { key: 'ph', className: 'btw-chip-img btw-chip-blank' })
+                  : h('img', { key: 'img', className: 'btw-chip-img', src: item.dataUrl, alt: item.name }),
+                h('button', {
+                  key: 'remove',
+                  type: 'button',
+                  className: 'btw-chip-x',
+                  title: t('imageRemove'),
+                  'aria-label': t('imageRemove'),
+                  onClick: () => { removeImage(item.id) },
+                }, '×'),
+              ]))),
+            notice === null ? null : h('p', { key: 'notice', className: 'btw-notice' }, notice),
+            h('div', { key: 'row', className: 'btw-composer-row' }, [
+              canAttach
+                ? h('button', {
+                  key: 'attach',
+                  type: 'button',
+                  className: 'btw-attach',
+                  title: t('attachHint'),
+                  'aria-label': t('attach'),
+                  disabled: busy,
+                  onClick: () => {
+                    const input = picker.current
+                    if (typeof input?.click === 'function') input.click()
+                  },
+                }, h(ClipIcon))
+                : null,
+              h('input', {
+                key: 'file',
+                type: 'file',
+                accept: IMAGE_TYPES.join(','),
+                multiple: true,
+                style: { display: 'none' },
+                ref: picker,
+                onChange: (event) => {
+                  const files = event.target.files
+                  try {
+                    event.target.value = ''
+                  } catch {
+                    /* a frozen event target still lets the read start */
+                  }
+                  addFiles(files)
+                },
+              }),
+              h('textarea', {
+                key: 'input',
+                className: 'btw-input',
+                value: draft,
+                rows: 2,
+                placeholder: t('placeholder'),
+                disabled: busy,
+                onChange: (event) => { setDraft(event.target.value) },
+                onPaste: (event) => {
+                  const files = event.clipboardData?.files
+                  if (files === undefined || files === null || files.length === 0) return
                   event.preventDefault()
-                  submit()
-                }
-              },
-            }),
-            h('button', {
-              key: 'send',
-              type: 'submit',
-              className: 'btw-button btw-button-primary',
-              disabled: busy || draft.trim() === '',
-            }, t('send')),
+                  if (!canAttach) {
+                    setNotice(t('imagesOff'))
+                    return
+                  }
+                  addFiles(files)
+                },
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    submit()
+                  }
+                },
+              }),
+              h('button', {
+                key: 'send',
+                type: 'submit',
+                className: 'btw-button btw-button-primary',
+                disabled: busy || draft.trim() === '',
+              }, t('send')),
+            ]),
           ]),
-          limits === undefined || limits === null ? null : h('p', { key: 'limits', className: 'btw-limits' },
-            `${t('replay')} ${limits.maxExchanges} · ${t('contextLimit')} ${limits.maxContextMessages}`),
+          limits === undefined || limits === null ? null : h('p', {
+            key: 'limits',
+            className: 'btw-limits',
+            title: limitsHint(limits, t),
+          }, limitsLine(limits, t)),
         ]),
       ])
     }
@@ -1132,19 +1566,56 @@ window.__ModuleLoader__.load({
     /** Navigation controller for the on-screen session, captured at activation. */
     let navigationRef = null
 
-    /** The `/btw` command row: opens the panel and says where the answer went. */
-    function BtwCommandRow({ t }) {
+    /**
+     * Command ids whose automatic open already ran.
+     *
+     * A transcript row is a record, not a command: the chat unmounts and
+     * remounts rows whenever its session is shown again, so an unguarded open
+     * would pull the right column open on every visit to that session.
+     */
+    const autoOpened = new Set()
+
+    /** Only a command that just ran may move the shell's layout. */
+    const AUTO_OPEN_WINDOW_MS = 30_000
+
+    /**
+     * Reveal the panel, which expands the right column.
+     *
+     * Skipped while the panel is already the active tab, because revealing it
+     * again would re-assert the column layout for no reason.
+     */
+    function revealPanel() {
+      try {
+        if (navigationRef?.active?.()?.kind === KIND) return
+        navigationRef?.openTab?.(KIND)
+      } catch {
+        /* the tab type is not registered yet; the guide still opens it */
+      }
+    }
+
+    /** The `/btw` command row: a record of the run, plus a way back into the panel. */
+    function BtwCommandRow({ node, t }) {
+      const commandId = typeof node?.commandId === 'string'
+        ? node.commandId
+        : typeof node?.seq === 'number' ? `seq:${node.seq}` : undefined
+      const justRan = typeof node?.time === 'number'
+        && Date.now() - node.time <= AUTO_OPEN_WINDOW_MS
       useEffect(() => {
-        try {
-          navigationRef?.openTab?.(KIND)
-        } catch {
-          /* the tab type is not registered yet; the guide still opens it */
-        }
-      }, [])
+        if (commandId === undefined || autoOpened.has(commandId)) return
+        autoOpened.add(commandId)
+        if (!justRan) return
+        revealPanel()
+      }, [commandId, justRan])
       return h('div', { className: 'btw-command' }, [
         h('style', { key: 'css' }, CSS),
         h('span', { key: 'dot', className: 'btw-command-dot' }),
         h('span', { key: 'text', className: 'btw-command-text' }, t('commandOpened')),
+        h('button', {
+          key: 'open',
+          type: 'button',
+          className: 'btw-command-open',
+          onClick: revealPanel,
+        }, t('openPanel')),
       ])
     }
 
@@ -1161,11 +1632,14 @@ window.__ModuleLoader__.load({
     const CSS = `
 .btw-root{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary);font-size:var(--dsh-content-font-size, 14px);line-height:calc(24px + var(--dsh-content-font-delta, 0px))}
 .btw-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-specific-sidebar-fill)}
-.btw-titles{display:flex;flex-direction:column;min-width:0}
+.btw-titles{display:flex;flex-direction:column;min-width:7rem;flex:1 1 auto}
 .btw-title{font-weight:600;font-size:13px;line-height:20px}
 .btw-hint{color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}
-.btw-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
-.btw-route{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;padding:2px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px}
+.btw-actions{display:flex;align-items:center;gap:6px;flex:0 1 auto;min-width:0}
+.btw-actions .btw-button{flex:0 0 auto}
+/* Grows with the column and ellipsizes only when it genuinely cannot fit; the
+   fixed 120px cap clipped a one-line model id even on a wide panel. */
+.btw-route{flex:0 1 auto;min-width:0;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;padding:2px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px}
 .btw-button{font:inherit;font-size:12px;line-height:18px;border-radius:8px;padding:4px 10px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-primary)}
 .btw-button:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2)}
 .btw-button:disabled{opacity:.45;cursor:default}
@@ -1184,6 +1658,10 @@ window.__ModuleLoader__.load({
 .btw-copy:hover{color:var(--dsw-alias-label-primary)}
 .btw-warn{color:var(--dsw-alias-state-warn-primary);font-size:10.5px;line-height:16px}
 .btw-empty-answer{margin:0;color:var(--dsw-alias-state-warn-primary);font-size:12px;line-height:20px}
+.btw-failure{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.btw-retry{font:inherit;font-size:11px;line-height:18px;padding:2px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer}
+.btw-retry:hover{background:var(--dsw-alias-bg-layer-2)}
+.btw-retry:disabled{opacity:.45;cursor:default}
 .btw-busy{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px}
 .btw-dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-brand-primary);animation:btw-pulse 1.1s ease-in-out infinite}
 @keyframes btw-pulse{0%,100%{opacity:.3}50%{opacity:1}}
@@ -1203,12 +1681,30 @@ window.__ModuleLoader__.load({
 .btw-details dt,.btw-details dd{min-width:0;margin:0}
 .btw-details dd{color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;text-align:right}
 .btw-note{color:var(--dsw-alias-state-idle-primary);font-size:10.5px;line-height:16px;margin:0}
-.btw-composer{display:flex;align-items:flex-end;gap:6px}
+.btw-composer{display:flex;flex-direction:column;gap:6px}
+.btw-composer-row{display:flex;align-items:flex-end;gap:6px}
+.btw-attach{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:26px;height:28px;padding:0;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.btw-attach:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
+.btw-attach:disabled{opacity:.45;cursor:default}
+.btw-attach svg{width:16px;height:16px}
+.btw-pending{display:flex;flex-wrap:wrap;gap:8px;padding:2px 0}
+.btw-chip{position:relative;display:inline-flex}
+.btw-chip-img{width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.btw-chip-blank{display:inline-block;animation:btw-pulse 1.1s ease-in-out infinite}
+.btw-chip-x{position:absolute;top:-5px;right:-5px;width:16px;height:16px;padding:0;line-height:14px;text-align:center;border-radius:50%;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;cursor:pointer}
+.btw-chip-x:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+.btw-notice{color:var(--dsw-alias-state-warn-primary);font-size:10.5px;line-height:16px;margin:0}
+.btw-question-body-media{padding:8px}
+.btw-question-images{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.btw-question-image{max-width:132px;max-height:96px;object-fit:cover;border-radius:6px;border:1px solid var(--dsw-alias-border-l1)}
+.btw-question-text{display:block;white-space:pre-wrap;word-break:break-word}
 .btw-input{flex:1 1 auto;min-width:0;resize:none;font:inherit;font-size:12.5px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px;outline:none}
 .btw-input:focus{border-color:var(--dsw-alias-brand-primary)}
 .btw-limits{color:var(--dsw-alias-state-idle-primary);font-size:10px;margin:0;font-variant-numeric:tabular-nums}
 .btw-command{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px}
 .btw-command-dot{width:6px;height:6px;border-radius:50%;border:1px solid var(--dsw-alias-brand-primary);background:transparent}
+.btw-command-open{margin-left:2px;padding:0 2px;border:none;background:transparent;font:inherit;font-size:11px;line-height:16px;color:var(--dsw-alias-brand-primary);cursor:pointer;border-radius:var(--dsw-radius-sm)}
+.btw-command-open:hover{text-decoration:underline}
 
 /* ---- answer body: the conversation's markdown rules, under btw-md ---- */
 .btw-md{min-width:0;overflow-wrap:anywhere;font:var(--dsw-font-markdown-base);color:var(--dsw-alias-label-primary)}
@@ -1270,7 +1766,11 @@ window.__ModuleLoader__.load({
        * Exposed for the offline test (`tests/verify.mjs`). The module loader
        * reads only `inject` and `apply`, so this key is inert at runtime.
        */
-      internal: { parseBlocks, renderInline, renderMarkdown, splitRow, highlight, usageSummary, UsageStrip, Exchange },
+      internal: {
+        parseBlocks, renderInline, renderMarkdown, splitRow, highlight, usageSummary, UsageStrip, Exchange,
+        BtwCommandRow, imageUrl, imageParts, pickImages, limitsLine, limitsHint, readImageFile,
+        routeLabel, routeTitle,
+      },
       apply(ctx) {
         navigationRef = ctx.sidebarRight
 

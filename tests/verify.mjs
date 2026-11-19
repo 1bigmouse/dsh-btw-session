@@ -25,6 +25,8 @@ let llmCalls = []
 let llmMode = 'plain'
 /** Position of the next streamed call inside the ask being tested. */
 let llmRound = 0
+/** Whether the parent conversation currently ends in an unresolved tool call. */
+let inFlightTurn = false
 
 function makeEffectHost() {
   return {
@@ -84,7 +86,21 @@ const fakeAgent = {
         source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
       },
       { id: 'm4', role: 'tool', content: [{ type: 'text', text: 'file contents' }], source: { kind: 'tool', callId: 'c1' }, toolCallId: 'c1' },
-      { id: 'm5', role: 'user', content: [{ type: 'text', text: 'Now add tests.' }], source: { kind: 'user' } },
+      { id: 'm5', role: 'user', content: [
+        { type: 'text', text: 'Now add tests.' },
+        // A screenshot the user sent earlier: the side request may look at it.
+        { type: 'image', attachment: CONTEXT_IMAGE },
+      ], source: { kind: 'user' } },
+      // A turn still in flight: one call that has no result yet.
+      ...(inFlightTurn ? [{
+        id: 'm6',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'About to read the file.' },
+          { type: 'tool-call', id: 'c-pending', name: 'read', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+      }] : []),
     ],
   },
 }
@@ -92,16 +108,73 @@ const fakeAgent = {
 /** Every registry lookup the side thread performed, in order. */
 const toolLookups = []
 
+/** Every prompt the fake attachment store was asked to admit. */
+const imageAdmissions = []
+/** When set, the next admission rejects with this message. */
+let imageRefusal = null
+/** Serial behind the durable references the fake store mints. */
+let imageSerial = 0
+/** A screenshot already attached to the parent conversation. */
+const CONTEXT_IMAGE = {
+  attachmentId: 'sha256:ctx', mediaType: 'image/png', bytes: 4, width: 640, height: 480,
+}
+
+/**
+ * The attachment store, reduced to the two calls a side request makes.
+ *
+ * `admitPromptContent` is where the deployment's count, byte, and format limits
+ * live for a real prompt, so the side request must route images through it
+ * instead of storing them itself.
+ */
+const fakeAttachments = {
+  imageLimits: {
+    maxImageBytes: 50 * 1024 * 1024,
+    maxImagesPerMessage: 20,
+    maxMessageImageBytes: 200 * 1024 * 1024,
+    maxImagePixels: 64_000_000,
+    maxImageDimension: 65_535,
+    mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+  },
+  async admitPromptContent(parts) {
+    imageAdmissions.push(parts)
+    if (imageRefusal !== null) throw new Error(imageRefusal)
+    return parts.map((part) => {
+      if (part.type !== 'image') return { type: 'text', text: part.text }
+      imageSerial += 1
+      return {
+        type: 'image',
+        attachment: {
+          attachmentId: `sha256:img${imageSerial}`,
+          mediaType: part.mediaType,
+          bytes: 4,
+          width: 800,
+          height: 600,
+          ...(part.name === undefined ? {} : { name: part.name }),
+        },
+      }
+    })
+  },
+  async readImage(ref) {
+    return { ref, data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) }
+  },
+}
+
 const services = new Map([
   ['agents', { get: id => (id === 'sess-1' ? fakeAgent : undefined) }],
   ['tools', {
     // Deliberately registry-wide-fragile: the Host must not depend on this.
     schemas: () => { throw new Error('bulk projection rejects unknown parameters') },
-    get: (name) => {
-      toolLookups.push(name)
+    // Reproduces the shipped behaviour: a scope-less lookup reads the global
+    // view, which does not carry this session's tools.
+    executable: (name, scope) => {
+      toolLookups.push({ name, scope: scope === fakeAgent ? 'agent' : scope === undefined ? 'global' : 'other' })
+      if (scope !== fakeAgent) return undefined
       if (name !== 'read' && name !== 'glob' && name !== 'grep' && name !== 'write') return undefined
       return { name, description: `${name} tool`, parameters: { type: 'object', properties: {} } }
     },
+    get: (name, scope) => (scope === fakeAgent
+      ? { name, description: `${name} tool`, parameters: { type: 'object', properties: {} } }
+      : undefined),
     execute: async (input) => {
       toolBatches.push(input)
       return {
@@ -121,6 +194,42 @@ const services = new Map([
       const round = llmRound
       return (async function* generate() {
         yield { type: 'block-start', index: 0, blockType: 'text' }
+        // A provider that fails without producing prose.
+        if (llmMode === 'error') {
+          yield { type: 'usage', usage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 } }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'provider exploded' } } }
+          return
+        }
+        // A provider that never answers until the request is aborted.
+        if (llmMode === 'hang') {
+          await new Promise((resolve) => {
+            if (options.signal?.aborted === true) {
+              resolve()
+              return
+            }
+            options.signal?.addEventListener?.('abort', () => resolve(), { once: true })
+          })
+          return
+        }
+        // A model that spends every round reading. `options.tools` is absent on
+        // the closing pass, which is how the fake tells the two apart.
+        if (llmMode === 'loop' || llmMode === 'loop-empty') {
+          if (options.tools !== undefined) {
+            yield {
+              type: 'block-end', index: 0,
+              block: { type: 'tool-call', id: `call-loop-${round}`, name: 'read', arguments: '{}' },
+            }
+            yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }
+            yield { type: 'finish', reason: { kind: 'tool-calls' } }
+            return
+          }
+          if (llmMode === 'loop') {
+            yield { type: 'text-delta', index: 0, text: 'Answered from what I read.' }
+            yield { type: 'usage', usage: { inputTokens: 5, outputTokens: 6, totalTokens: 11 } }
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
         if (llmMode === 'tools' && round === 1) {
           // A round that gathers files before answering.
           yield { type: 'text-delta', index: 0, text: 'Let me read it.' }
@@ -152,6 +261,18 @@ const services = new Map([
           yield { type: 'finish', reason: { kind: 'stop' } }
           return
         }
+        if (llmMode === 'markup-lookalike' && round === 1) {
+          // The same fallback with separators the model made up: a box-drawing
+          // bar, a full-width bar, a zero-width joiner inside the token, and the
+          // whole token in full-width letters.
+          yield { type: 'text-delta', index: 0, text: 'Let me check.\n' }
+          yield { type: 'text-delta', index: 0, text: '\u2502 DSML \u2502 calls>\n\uFF5C DSML \uFF5C invoke name="read">\n' }
+          yield { type: 'text-delta', index: 0, text: '\u2502 DS\u200BML \u2502 parameter name="path">a.ts</\u2502 DSML \u2502 parameter>' }
+          yield { type: 'text-delta', index: 0, text: '\n\uFF1C \uFF5C \uFF24\uFF33\uFF2D\uFF2C \uFF5C invoke name="glob">' }
+          yield { type: 'usage', usage: { inputTokens: 40, outputTokens: 20, totalTokens: 60 } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
         yield { type: 'text-delta', index: 0, text: llmMode === 'tools' ? 'It ' : 'It ' }
         yield { type: 'text-delta', index: 0, text: llmMode === 'tools' ? 'holds a.ts.' : 'parses.' }
         yield {
@@ -168,6 +289,7 @@ const services = new Map([
     },
   }],
   ['commands', { register(definition) { commands.set(definition.name, definition); return () => commands.delete(definition.name) } }],
+  ['attachments', fakeAttachments],
   ['connection', {
     fetch: {
       register(route) { routes.set(route.path, route); return async () => { routes.delete(route.path) } },
@@ -184,14 +306,24 @@ const hostCtx = {
 hostCtx.get = name => services.get(name)
 
 const hostModule = await import(pathToFileURL(`${ROOT}/index.js`).href)
-hostModule.apply(hostCtx, { maxExchanges: 20, maxContextMessages: 80, maxContextChars: 48000, maxOutputTokens: 2048 })
+hostModule.apply(hostCtx, {
+  maxExchanges: 20,
+  maxContextMessages: 80,
+  maxContextChars: 48000,
+  maxOutputTokens: 2048,
+  // Deliberately small: the request-image cap has to be observable.
+  maxRequestImages: 4,
+  // Deliberately short: the timeout path has to be reachable in a test.
+  timeoutMs: 300,
+})
 
 check('host: inject declares its services', JSON.stringify(hostModule.inject) === '["agents","llm","commands","tools"]', hostModule.inject)
 check('host: /btw command registered', commands.has('btw'), [...commands.keys()])
-check('host: three Fetch routes registered',
-  routes.has('/api/btw/state') && routes.has('/api/btw/ask') && routes.has('/api/btw/close'),
+check('host: four Fetch routes registered',
+  routes.has('/api/btw/state') && routes.has('/api/btw/ask') && routes.has('/api/btw/close') && routes.has('/api/btw/image'),
   [...routes.keys()])
 check('host: ask route accepts POST only', routes.get('/api/btw/ask')?.methods?.join() === 'POST', routes.get('/api/btw/ask')?.methods)
+check('host: image route accepts GET only', routes.get('/api/btw/image')?.methods?.join() === 'GET', routes.get('/api/btw/image')?.methods)
 
 const jsonRequest = (path, body) => new Request(`https://btw.example.test${path}`, {
   method: body === undefined ? 'GET' : 'POST',
@@ -212,6 +344,9 @@ check('command: returns a constant notice', commandResult.kind === 'success' && 
 check('command: keeps the question out of the log payload', command.recordInput === false, command.recordInput)
 check('command: queues the trimmed question', queued.pending === 'What does the parser do?', queued.pending)
 check('command: does not call the model', llmCalls.length === 0, llmCalls.length)
+const bareCommand = command.handler({ agent: fakeAgent, rawInput: '   ' })
+check('command: a bare /btw opens the panel instead of complaining',
+  bareCommand.kind === 'success' && /type the side question/.test(bareCommand.text), bareCommand)
 
 // The panel performs the request.
 const asked = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', { sessionId: 'sess-1', question: 'What does the parser do?' }))).json()
@@ -239,6 +374,12 @@ check('request: every message carries id, source and content',
 check('request: assistant carries the model source',
   call.messages[1].source?.kind === 'model' && call.messages[1].source.provider === 'deepseek', call.messages[1].source)
 check('request: question is last', call.messages.at(-1).content[0].text === 'What does the parser do?', call.messages.at(-1).content[0].text)
+check('request: a screenshot already in the conversation is forwarded',
+  call.messages.some(message => message.content.some(block => block.type === 'image'
+    && block.attachment?.attachmentId === CONTEXT_IMAGE.attachmentId)),
+  call.messages.map(message => message.content.map(block => block.type).join('+')))
+check('request: the system prompt says an image is attached',
+  typeof call.system === 'string' && call.system.includes('attached image'), call.system)
 
 // The side thread reports its own accounting.
 const after = await (await routes.get('/api/btw/state').fetch(jsonRequest('/api/btw/state?session=sess-1'))).json()
@@ -328,8 +469,56 @@ check('tools: a failing bulk projection does not empty the list',
   Array.isArray(withTools.snapshot?.tools?.names) && withTools.snapshot.tools.names.length === 3,
   withTools.snapshot?.tools)
 check('tools: the registry is asked by name, one tool at a time',
-  toolLookups.includes('read') && toolLookups.includes('glob') && toolLookups.includes('grep'),
-  toolLookups)
+  ['read', 'glob', 'grep'].every(name => toolLookups.some(entry => entry.name === name)),
+  toolLookups.map(entry => entry.name).join(','))
+check('tools: every lookup passes the agent as its scope',
+  toolLookups.length > 0 && toolLookups.every(entry => entry.scope === 'agent'),
+  toolLookups.map(entry => `${entry.name}:${entry.scope}`).join(' '))
+
+// A model that spends every tool round reading must still answer the question.
+llmMode = 'loop'
+llmRound = 0
+const loopBefore = llmCalls.length
+const looped = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'What are the current changes?',
+}))).json()
+const loopCalls = llmCalls.slice(loopBefore)
+const closingCall = loopCalls.at(-1)
+check('tools: the tool rounds all ran before the closing pass',
+  loopCalls.length === 6, loopCalls.length)
+check('tools: a question that spends its whole budget still gets an answer',
+  looped.snapshot?.messages?.at(-1)?.text === 'Answered from what I read.',
+  looped.snapshot?.messages?.at(-1)?.text)
+check('tools: the closing pass is sent without tools',
+  closingCall?.tools === undefined && (loopCalls.at(-2)?.tools?.length ?? 0) === 3,
+  { closing: closingCall?.tools, lastRound: loopCalls.at(-2)?.tools?.length })
+check('tools: the closing prompt says the budget is spent',
+  /budget .* is spent/.test(closingCall?.system ?? ''), closingCall?.system?.slice(-140))
+check('tools: the closing pass ends with a user turn that says tools are gone',
+  closingCall?.messages?.at(-1)?.role === 'user'
+  && /No tools are available/.test(closingCall?.messages?.at(-1)?.content?.[0]?.text ?? ''),
+  closingCall?.messages?.at(-1))
+check('tools: only the paid rounds executed calls',
+  looped.measurement?.toolCalls === 4 && looped.measurement?.droppedCalls === 1,
+  { executed: looped.measurement?.toolCalls, dropped: looped.measurement?.droppedCalls })
+check('tools: the exhausted budget is recorded',
+  looped.measurement?.toolBudgetExhausted === true, looped.measurement?.toolBudgetExhausted)
+check('tools: the closing pass counts as a round',
+  looped.measurement?.rounds === 6, looped.measurement?.rounds)
+
+// Even a closing pass can come back empty; that must be reported, not hidden.
+llmMode = 'loop-empty'
+llmRound = 0
+const loopEmpty = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'And now?',
+}))).json()
+const loopEmptyAnswer = loopEmpty.snapshot?.messages?.at(-1)
+check('tools: an empty closing pass is recorded with its reason',
+  loopEmpty.ok === true && loopEmptyAnswer?.text === ''
+  && loopEmptyAnswer?.metrics?.toolBudgetExhausted === true,
+  { text: loopEmptyAnswer?.text, metrics: loopEmptyAnswer?.metrics?.toolBudgetExhausted })
+llmMode = 'plain'
+llmRound = 0
 
 // Markup a provider left in the prose must never reach the panel.
 llmMode = 'markup'
@@ -344,6 +533,20 @@ check('markup: the prose around it survives', markupText === 'Let me check.', ma
 check('markup: the measurement records the fallback',
   markupAsk.measurement?.toolMarkup === true, markupAsk.measurement?.toolMarkup)
 check('markup: no tool round ran', markupAsk.measurement?.rounds === 1, markupAsk.measurement?.rounds)
+
+// The same fallback with separators the model invented must be recognized too:
+// matching only the ASCII pipe once let a whole call render as the answer.
+llmMode = 'markup-lookalike'
+llmRound = 0
+const lookalikeAsk = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'Where is a.ts?',
+}))).json()
+const lookalikeText = lookalikeAsk.snapshot?.messages?.at(-1)?.text ?? ''
+check('markup: a made-up separator is still recognized',
+  lookalikeText === 'Let me check.' && lookalikeAsk.measurement?.toolMarkup === true,
+  { text: lookalikeText, stripped: lookalikeAsk.measurement?.toolMarkup })
+check('markup: no box-drawing or full-width bar survives',
+  !/[\u2502\uFF5C]/.test(lookalikeText) && !/DSML/i.test(lookalikeText), lookalikeText)
 
 // An ask that produced no prose must still be recorded, with its reason.
 llmMode = 'reasoning'
@@ -364,12 +567,196 @@ check('empty: the question is kept for the next turn',
   emptyAsk.snapshot?.messages?.at(-2)?.text)
 llmMode = 'plain'
 
+// ------------------------------------------------------------------- images
+
+const PNG_BASE64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64')
+const askedWithImage = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1',
+  question: 'What is wrong in this screenshot?',
+  images: [{ mediaType: 'image/png', data: PNG_BASE64, name: 'clip.png' }],
+}))).json()
+check('images: a question may carry one image', askedWithImage.ok === true, askedWithImage.error)
+const imageCall = llmCalls.at(-1)
+const imageQuestion = imageCall?.messages?.at(-1)
+const askedRef = imageQuestion?.content?.find(block => block.type === 'image')?.attachment
+check('images: the question carries the durable reference',
+  askedRef !== undefined && typeof askedRef.attachmentId === 'string' && askedRef.mediaType === 'image/png',
+  imageQuestion?.content)
+check('images: admission went through the attachment service',
+  imageAdmissions.length === 1 && imageAdmissions[0].length === 2
+  && imageAdmissions[0][1].name === 'clip.png',
+  imageAdmissions.map(parts => parts.map(part => part.type).join('+')))
+check('images: the panel gets the reference back for the question row',
+  (askedWithImage.snapshot?.messages ?? []).some(message => message.attachments?.[0]?.attachmentId === askedRef?.attachmentId),
+  (askedWithImage.snapshot?.messages ?? []).map(message => message.attachments))
+check('images: measurement separates asked and request images',
+  askedWithImage.measurement?.askedImages === 1 && askedWithImage.measurement?.requestImages === 2
+  && askedWithImage.measurement?.contextImages === 1,
+  {
+    asked: askedWithImage.measurement?.askedImages,
+    request: askedWithImage.measurement?.requestImages,
+    context: askedWithImage.measurement?.contextImages,
+  })
+
+// The panel draws the picture it asked about through this route.
+const imageRoute = routes.get('/api/btw/image')
+const served = await imageRoute.fetch(jsonRequest(
+  `/api/btw/image?session=sess-1&attachment=${encodeURIComponent(askedRef?.attachmentId ?? '')}`,
+))
+const servedBytes = new Uint8Array(await served.arrayBuffer())
+check('images: the route serves the admitted image', served.status === 200
+  && served.headers.get('content-type') === 'image/png', served.status)
+check('images: the served bytes are the stored object',
+  servedBytes.length === 4 && servedBytes[0] === 0x89, [...servedBytes])
+const foreign = await imageRoute.fetch(jsonRequest('/api/btw/image?session=sess-1&attachment=sha256%3Aelsewhere'))
+check('images: a reference this thread never admitted is a 404', foreign.status === 404, foreign.status)
+const noAttachment = await imageRoute.fetch(jsonRequest('/api/btw/image?session=sess-1'))
+check('images: a missing attachment id is a 400', noAttachment.status === 400, noAttachment.status)
+
+// The request keeps only the newest occurrences.
+const capped = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1',
+  question: 'Which of these six shots matters?',
+  images: Array.from({ length: 6 }, (_, index) => ({
+    mediaType: 'image/jpeg', data: PNG_BASE64, name: `shot-${index}.jpg`,
+  })),
+}))).json()
+const cappedCall = llmCalls.at(-1)
+const notes = (cappedCall?.messages ?? []).flatMap(message => message.content)
+  .filter(block => block.type === 'text' && /omitted to fit the request limit/.test(block.text))
+check('images: the request keeps only the newest occurrences',
+  capped.measurement?.requestImages === 4 && capped.measurement?.askedImages === 6,
+  { request: capped.measurement?.requestImages, asked: capped.measurement?.askedImages })
+check('images: dropped occurrences are replaced by a note', notes.length === 4, notes.length)
+check('images: a capped request still answers', capped.ok === true, capped.error)
+
+// Refusals.
+const tooMany = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1',
+  question: 'too many',
+  images: Array.from({ length: 7 }, () => ({ mediaType: 'image/png', data: PNG_BASE64 })),
+}))).json()
+check('images: more images than one question allows are refused',
+  tooMany.ok === false && tooMany.error?.code === 'too-many-images', tooMany.error)
+const wrongType = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1',
+  question: 'a pdf',
+  images: [{ mediaType: 'application/pdf', data: PNG_BASE64 }],
+}))).json()
+check('images: a non-raster payload is refused',
+  wrongType.ok === false && wrongType.error?.code === 'bad-image', wrongType.error)
+imageRefusal = 'Image exceeds the configured byte limit.'
+const storeRefusal = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1',
+  question: 'a huge one',
+  images: [{ mediaType: 'image/png', data: PNG_BASE64 }],
+}))).json()
+imageRefusal = null
+check('images: a store refusal becomes a business failure',
+  storeRefusal.ok === false && storeRefusal.error?.code === 'image-refused'
+  && /byte limit/.test(storeRefusal.error.message), storeRefusal.error)
+const afterRefusal = await (await routes.get('/api/btw/state').fetch(jsonRequest('/api/btw/state?session=sess-1'))).json()
+check('images: a refused question does not leave the panel busy',
+  afterRefusal.busy === false && afterRefusal.open === true, { busy: afterRefusal.busy, open: afterRefusal.open })
+check('images: the panel is told image input is available',
+  afterRefusal.images?.enabled === true && afterRefusal.images?.max === 6, afterRefusal.images)
+
+// ------------------------------------------------ settled context and failures
+
+// A turn still in flight is not a conversation yet: only settled messages travel.
+inFlightTurn = true
+llmMode = 'plain'
+llmRound = 0
+const settledBefore = llmCalls.length
+const settledAsk = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'Where are we?',
+}))).json()
+const settledCall = llmCalls[settledBefore]
+inFlightTurn = false
+check('settled: an unfinished turn ends the snapshot',
+  !(settledCall?.messages ?? []).some(message => message.content
+    .some(block => block.type === 'text' && block.text === 'About to read the file.')),
+  (settledCall?.messages ?? []).map(message => message.role))
+check('settled: an unresolved call never enters the request',
+  !(settledCall?.messages ?? []).some(message => message.content.some(block => block.type === 'tool-call')),
+  (settledCall?.messages ?? []).map(message => message.content.map(block => block.type).join('+')))
+check('settled: the settled part still reaches the model',
+  settledAsk.ok === true && (settledCall?.messages ?? [])
+    .some(message => message.content.some(block => block.text === 'Now add tests.')),
+  settledCall?.messages?.length)
+
+// A provider failure is a row the panel can act on, not a dead end.
+llmMode = 'error'
+llmRound = 0
+const failedAsk = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'Summarize the plan.',
+}))).json()
+const failedRow = failedAsk.snapshot?.messages?.at(-1)
+check('failure: a provider error is recorded as a retryable row',
+  failedAsk.ok === true && failedRow?.failure?.reason === 'error' && failedRow?.text === '',
+  { ok: failedAsk.ok, failure: failedRow?.failure })
+check('failure: the row keeps the usage that was billed',
+  failedAsk.measurement?.inputTokens === 7 && failedAsk.snapshot?.totals?.failed >= 1,
+  { input: failedAsk.measurement?.inputTokens, failed: failedAsk.snapshot?.totals?.failed })
+const usersAtFailure = (failedAsk.snapshot?.messages ?? []).filter(message => message.role === 'user').length
+
+llmMode = 'plain'
+llmRound = 0
+const retried = await (await routes.get('/api/btw/retry').fetch(jsonRequest('/api/btw/retry', {
+  sessionId: 'sess-1', key: failedRow?.key,
+}))).json()
+const retriedRow = retried.snapshot?.messages?.at(-1)
+check('retry: the same question is answered again',
+  retried.ok === true && retriedRow?.text === 'It parses.' && retriedRow?.failure === null,
+  { ok: retried.ok, text: retriedRow?.text, failure: retriedRow?.failure })
+check('retry: no second question row is added',
+  (retried.snapshot?.messages ?? []).filter(message => message.role === 'user').length === usersAtFailure,
+  (retried.snapshot?.messages ?? []).filter(message => message.role === 'user').length)
+check('retry: the failed row is replaced in place',
+  (retried.snapshot?.messages ?? []).length === (failedAsk.snapshot?.messages ?? []).length,
+  [(failedAsk.snapshot?.messages ?? []).length, (retried.snapshot?.messages ?? []).length])
+const answeredKey = retriedRow?.key
+const notRetryable = await (await routes.get('/api/btw/retry').fetch(jsonRequest('/api/btw/retry', {
+  sessionId: 'sess-1', key: answeredKey,
+}))).json()
+check('retry: a successful row is not retryable',
+  notRetryable.ok === false && notRetryable.error?.code === 'answered', notRetryable.error)
+
+// A provider that never answers fails on the timer instead of spinning forever.
+llmMode = 'hang'
+const timedOut = await (await routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'Are you there?',
+}))).json()
+const timeoutRow = timedOut.snapshot?.messages?.at(-1)
+check('timeout: a hung request fails instead of spinning forever',
+  timedOut.ok === true && timeoutRow?.failure?.reason === 'timeout', timeoutRow?.failure)
+check('timeout: the row says how long it waited',
+  /within \d+s/.test(timeoutRow?.failure?.message ?? ''), timeoutRow?.failure?.message)
+check('timeout: the thread is free again',
+  timedOut.snapshot?.busy === false, timedOut.snapshot?.busy)
+
+// Closing the panel mid-answer discards the result instead of resurrecting it.
+llmMode = 'hang'
+const pendingAnswer = routes.get('/api/btw/ask').fetch(jsonRequest('/api/btw/ask', {
+  sessionId: 'sess-1', question: 'still there?',
+}))
+await new Promise((resolve) => setTimeout(resolve, 20))
+await routes.get('/api/btw/close').fetch(jsonRequest('/api/btw/close', { sessionId: 'sess-1' }))
+const closedMidAnswer = await (await pendingAnswer).json()
+check('close: an in-flight answer is discarded',
+  closedMidAnswer.ok === true && closedMidAnswer.stale === true, closedMidAnswer)
+const afterMidClose = await (await routes.get('/api/btw/state').fetch(jsonRequest('/api/btw/state?session=sess-1'))).json()
+check('close: the discarded answer does not come back',
+  afterMidClose.open === false && afterMidClose.messages.length === 0, afterMidClose)
+llmMode = 'plain'
+llmRound = 0
+
 // -------------------------------------------------------------- Client half
 
 let moduleSpec
 globalThis.window = { __ModuleLoader__: { load(spec) { moduleSpec = spec } } }
 
-const clientRegistrations = { locale: [], tabTypes: [], closeHandlers: [], slots: [] }
+const clientRegistrations = { locale: [], tabTypes: [], closeHandlers: [], slots: [], openCalls: [], activeTab: undefined }
 const clientDisposers = []
 function fakeCtx() {
   const scope = {
@@ -406,7 +793,8 @@ clientServices.set('sidebarRightTabs', {
 })
 clientServices.set('sidebarRight', {
   registerCloseHandler(kind, handler) { clientRegistrations.closeHandlers.push([kind, handler]); return () => {} },
-  openTab(kind) { clientRegistrations.opened = kind },
+  openTab(kind) { clientRegistrations.opened = kind; clientRegistrations.openCalls.push(kind) },
+  active() { return clientRegistrations.activeTab },
 })
 clientServices.set('slots', {
   inject(owner, callback) { return callback() },
@@ -426,6 +814,8 @@ const clientCtx = {
 await import(pathToFileURL(`${ROOT}/client.js`).href)
 check('client: registers through the module loader', moduleSpec?.id === 'dsh-btw-session', moduleSpec?.id)
 
+/** When set, the next `useState` starts from this value (a pre-loaded panel). */
+let seedNext
 /** Component state captured by the stub React, so a click can be observed. */
 const stateSlots = []
 /** When set, the next `useState` starts from `true` (renders an opened disclosure). */
@@ -436,10 +826,17 @@ const fakeReact = {
     return { type, props: props ?? {}, children: children.flat(2) }
   },
   useCallback: fn => fn,
-  useEffect: () => {},
+  // The stub runs effects inline so a mount-time decision can be observed.
+  useEffect: (fn) => { fn() },
   useMemo: fn => fn(),
   useRef: value => ({ current: value }),
   useState(initial) {
+    if (seedNext !== undefined) {
+      const seeded = { value: seedNext }
+      seedNext = undefined
+      stateSlots.push(seeded)
+      return [seeded.value, next => { seeded.value = typeof next === 'function' ? next(seeded.value) : next }]
+    }
     if (openNext) {
       openNext = false
       const slot = { value: true }
@@ -489,6 +886,62 @@ const closeHandler = clientRegistrations.closeHandlers.find(([kind]) => kind ===
 check('client: registers a close handler for the tab kind',
   closeHandler !== undefined && typeof closeHandler[1] === 'function', closeHandler?.[0])
 
+// -------------------------------------------------- command row and the layout
+
+const { BtwCommandRow } = clientModule.internal
+/** The row's own copy; this block runs before the shared translator exists. */
+const rowT = key => ({ commandOpened: 'sent to the panel', openPanel: 'Open panel' })[key] ?? key
+const commandNode = overrides => ({
+  kind: 'command', seq: 1, time: Date.now(), commandId: 'cmd-fresh',
+  name: 'btw', args: 'q', outcome: { kind: 'success', text: 'Btw panel opened' }, ...overrides,
+})
+
+const openCount = () => clientRegistrations.openCalls.length
+const beforeOpens = openCount()
+walk(BtwCommandRow({ node: commandNode(), t: rowT }))
+check('command row: a command that just ran opens the panel once',
+  openCount() - beforeOpens === 1, openCount() - beforeOpens)
+
+// The chat unmounts and remounts rows on every session visit.
+walk(BtwCommandRow({ node: commandNode(), t: rowT }))
+walk(BtwCommandRow({ node: commandNode(), t: rowT }))
+check('command row: remounting the same row does not reopen it',
+  openCount() - beforeOpens === 1, openCount() - beforeOpens)
+
+// A row from an earlier visit is a record; it must not move the shell layout.
+const beforeOld = openCount()
+walk(BtwCommandRow({
+  node: commandNode({ commandId: 'cmd-old', seq: 9, time: Date.now() - 3_600_000 }),
+  t: rowT,
+}))
+check('command row: a historical row leaves the layout alone',
+  openCount() === beforeOld, openCount() - beforeOld)
+check('command row: a historical row still offers a way in',
+  collectByClass(BtwCommandRow({
+    node: commandNode({ commandId: 'cmd-old2', seq: 10, time: Date.now() - 3_600_000 }),
+    t: rowT,
+  }), 'btw-command-open').length === 1,
+  collectByClass(BtwCommandRow({
+    node: commandNode({ commandId: 'cmd-old3', seq: 11, time: Date.now() - 3_600_000 }),
+    t: rowT,
+  }), 'btw-command-open').length)
+
+// Pressing that control is the user's own decision, so it may open.
+const manual = collectByClass(BtwCommandRow({
+  node: commandNode({ commandId: 'cmd-manual', seq: 12, time: Date.now() - 3_600_000 }),
+  t: rowT,
+}), 'btw-command-open')[0]
+const beforeManual = openCount()
+manual.props.onClick()
+check('command row: the manual control opens the panel', openCount() - beforeManual === 1, openCount() - beforeManual)
+
+// Already the active tab: revealing it again would re-assert the column.
+clientRegistrations.activeTab = { kind: 'btw' }
+const beforeActive = openCount()
+walk(BtwCommandRow({ node: commandNode({ commandId: 'cmd-active', seq: 13 }), t: rowT }))
+check('command row: an already visible panel is not re-opened', openCount() === beforeActive, openCount() - beforeActive)
+clientRegistrations.activeTab = undefined
+
 // ------------------------------------------------------------------ markdown
 
 /** Flatten one built React tree into tags and text. */
@@ -510,9 +963,13 @@ function walk(node, tags = [], texts = []) {
   return { tags, texts }
 }
 
-const { parseBlocks, renderMarkdown, highlight, usageSummary, UsageStrip, Exchange } = clientModule.internal
+const {
+  parseBlocks, renderMarkdown, highlight, usageSummary, UsageStrip, Exchange,
+  imageUrl, imageParts, pickImages, limitsLine, limitsHint, readImageFile,
+  routeLabel, routeTitle,
+} = clientModule.internal
 const translate = (key, params) => {
-  const dict = { copy: 'Copy', copied: 'Copied', copyAnswer: 'Copy the answer', reads: '{count} reads', noContext: 'no context sent', emptyMarkup: 'model wrote its tool call as text', emptyTruncated: 'cut off at the output limit', emptyError: 'failed before any text', emptyAborted: 'cancelled', emptyNoText: 'returned no text' }
+  const dict = { copy: 'Copy', copied: 'Copied', copyAnswer: 'Copy the answer', openPanel: 'Open panel', reads: '{count} reads', noContext: 'no context sent', emptyMarkup: 'model wrote its tool call as text', emptyTruncated: 'cut off at the output limit', emptyError: 'failed before any text', emptyAborted: 'cancelled', emptyNoText: 'returned no text' }
   const raw = dict[key] ?? {
     askCount: '{count} asks',
     cacheHit: 'cache hit {percent}%',
@@ -534,7 +991,23 @@ const translate = (key, params) => {
     collapse: 'Hide usage detail',
     toolList: 'Tools',
     toolOff: 'off',
+    toolOffDisabled: 'off (empty whitelist)',
+    toolOffNoRegistry: 'off (no tool service)',
+    toolOffNotAdmitted: 'off (not granted to this session)',
+    toolOffUncloneable: 'off (schema not serializable)',
+    toolOffIdle: 'not used yet',
     toolMarkupNote: 'tool call came back as text',
+    emptyToolBudget: 'tool rounds ran out after {reads} looks',
+    budgetWarn: 'read budget hit',
+    budgetWarnTitle: 'the tool rounds ran out before this answer',
+    retry: 'Retry',
+    failureTimeout: 'did not finish in time',
+    failureInterrupted: 'cancelled',
+    failureError: 'the model call failed',
+    route: 'Model',
+    imageCount: 'Images',
+    limitsLine: 'replay ≤{replay} turns · context ≤{context} msgs',
+    limitsHint: 'built from the last {context} messages (older ones drop off past {chars} characters) plus the last {replay} turns',
   }[key] ?? key
   return typeof raw === 'string'
     ? raw.replace(/\{(\w+)\}/g, (whole, name) => (params?.[name] === undefined ? whole : String(params[name])))
@@ -755,6 +1228,208 @@ check('answer row: a failed call says so',
 check('answer row: an unexplained empty answer still reports',
   blankFor({ finish: 'stop' }).includes('returned no text'),
   blankFor({ finish: 'stop' }))
+check('answer row: an exhausted read budget explains itself',
+  blankFor({ toolBudgetExhausted: true, toolCalls: 8, finish: 'stop' }).includes('8 looks'),
+  blankFor({ toolBudgetExhausted: true, toolCalls: 8, finish: 'stop' }))
+// A tool round that ran out but still produced an answer is flagged, not hidden.
+const budgetTree = Exchange({
+  message: {
+    key: 'a8', role: 'assistant', text: 'Partial answer.',
+    metrics: { toolBudgetExhausted: true, toolCalls: 3, inputTokens: 10, outputTokens: 4, llmMs: 900 },
+  },
+  t: translate,
+})
+check('answer row: a thinner answer says the read budget ran out',
+  collectByClass(budgetTree, 'btw-warn').length === 1
+  && walk(budgetTree).texts.join('|').includes('read budget hit'),
+  walk(budgetTree).texts.join('|'))
+check('answer row: the flag does not fire without the budget flag',
+  collectByClass(Exchange({
+    message: { key: 'a9', role: 'assistant', text: 'Full.', metrics: { toolCalls: 3, inputTokens: 2, outputTokens: 2, llmMs: 100 } },
+    t: translate,
+  }), 'btw-warn').length === 0)
+
+// A failed attempt is actionable: the reason, plus a Retry that names its row.
+const retriedKeys = []
+const failureTree = Exchange({
+  message: {
+    key: 'a7', role: 'assistant', text: '',
+    failure: { reason: 'timeout', message: 'The model did not finish within 300s.' },
+    metrics: { inputTokens: 3, outputTokens: 0, llmMs: 300000 },
+  },
+  t: translate,
+  onRetry: key => retriedKeys.push(key),
+})
+check('failure row: the reason is shown',
+  walk(failureTree).texts.join('|').includes('did not finish in time'), walk(failureTree).texts.join('|'))
+check('failure row: a row with no text offers no copy control',
+  collectByClass(failureTree, 'btw-copy').length === 0, collectByClass(failureTree, 'btw-copy').length)
+const retryButton = collectByClass(failureTree, 'btw-retry')[0]
+check('failure row: Retry is offered', retryButton !== undefined, collectByClass(failureTree, 'btw-retry').length)
+retryButton?.props.onClick()
+check('failure row: Retry names the row it belongs to', retriedKeys[0] === 'a7', retriedKeys)
+check('empty answer: an explained empty row is retryable too',
+  collectByClass(Exchange({
+    message: { key: 'a6', role: 'assistant', text: '', metrics: { finish: 'stop' } },
+    t: translate,
+    onRetry: () => {},
+  }), 'btw-retry').length === 1)
+
+// ------------------------------------------------------------------- images
+
+const questionImage = {
+  attachmentId: 'sha256:abcd', mediaType: 'image/png', bytes: 10, width: 320, height: 200, name: 'shot.png',
+}
+check('images: a stored reference becomes a Host url',
+  imageUrl('sess-1', questionImage) === '/api/btw/image?session=sess-1&attachment=sha256%3Aabcd',
+  imageUrl('sess-1', questionImage))
+check('images: a reference without an id never becomes a url',
+  imageUrl('sess-1', {}) === '' && imageUrl(undefined, questionImage) === '', imageUrl(undefined, questionImage))
+
+const imageQuestionTree = Exchange({
+  message: { key: 'q1', role: 'user', text: 'what is wrong here?', attachments: [questionImage] },
+  t: translate,
+  sessionId: 'sess-1',
+})
+const rendered = collectByClass(imageQuestionTree, 'btw-question-image')
+check('question row: an attached image is drawn from the Host route',
+  rendered.length === 1 && rendered[0].props.src === imageUrl('sess-1', questionImage), rendered[0]?.props)
+check('question row: the picture keeps its file name for the hover title',
+  rendered[0]?.props.title === 'shot.png', rendered[0]?.props)
+check('question row: the text survives next to the picture',
+  walk(imageQuestionTree).texts.join('|').includes('what is wrong here?'),
+  walk(imageQuestionTree).texts.join('|'))
+
+check('images: only chips that finished reading are sent',
+  JSON.stringify(imageParts([
+    { status: 'ready', mediaType: 'image/png', data: 'AAA', name: 'a.png' },
+    { status: 'reading', mediaType: 'image/png', data: '' },
+    { status: 'failed', mediaType: 'image/png', data: 'BBB' },
+  ])) === JSON.stringify([{ mediaType: 'image/png', data: 'AAA', name: 'a.png' }]),
+  imageParts([{ status: 'ready', mediaType: 'image/png', data: 'AAA', name: 'a.png' }]))
+check('images: a nameless image sends no name member',
+  JSON.stringify(imageParts([{ status: 'ready', mediaType: 'image/png', data: 'AAA', name: '' }]))
+  === JSON.stringify([{ mediaType: 'image/png', data: 'AAA' }]),
+  imageParts([{ status: 'ready', mediaType: 'image/png', data: 'AAA', name: '' }]))
+
+const picked = pickImages([{ type: 'image/png' }, { type: 'application/pdf' }, { type: 'image/webp' }], 6)
+check('images: the picker keeps rasters and drops everything else',
+  picked.files.length === 2 && picked.refusal === null, picked)
+check('images: a pick with no image says so',
+  pickImages([{ type: 'application/pdf' }], 6).refusal === 'imagesOnly',
+  pickImages([{ type: 'application/pdf' }], 6))
+check('images: a full question refuses the pick',
+  pickImages([{ type: 'image/png' }], 0).refusal === 'imageLimit',
+  pickImages([{ type: 'image/png' }], 0))
+check('images: an over-full pick is trimmed to the free slots',
+  pickImages([{ type: 'image/png' }, { type: 'image/png' }, { type: 'image/png' }], 2).files.length === 2,
+  pickImages([{ type: 'image/png' }, { type: 'image/png' }, { type: 'image/png' }], 2))
+
+globalThis.FileReader = class {
+  readAsDataURL() {
+    this.result = 'data:image/png;base64,iVBORw0KGgo='
+    this.onload()
+  }
+}
+const readResult = await readImageFile({ name: 'a.png' })
+check('images: reading a file keeps the base64 payload and a preview url',
+  readResult.data === 'iVBORw0KGgo=' && readResult.dataUrl.startsWith('data:image/png;base64,'),
+  readResult)
+delete globalThis.FileReader
+
+check('footer: the budget line names both numbers without a manual',
+  limitsLine({ maxExchanges: 20, maxContextMessages: 80 }, translate) === 'replay ≤20 turns · context ≤80 msgs',
+  limitsLine({ maxExchanges: 20, maxContextMessages: 80 }, translate))
+check('footer: the tooltip spells the character budget out',
+  limitsHint({ maxExchanges: 20, maxContextMessages: 80, maxContextChars: 48000 }, translate).includes('48000'),
+  limitsHint({ maxExchanges: 20, maxContextMessages: 80, maxContextChars: 48000 }, translate))
+
+// The model chip: short enough to fit, never a dead end.
+check('header: a provider prefix the model id repeats is dropped',
+  routeLabel({ provider: 'deepseek', model: 'deepseek/deepseek-v4.1-flash' }) === 'deepseek-v4.1-flash',
+  routeLabel({ provider: 'deepseek', model: 'deepseek/deepseek-v4.1-flash' }))
+check('header: an unrelated provider keeps the whole model id',
+  routeLabel({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }) === 'deepseek/deepseek-v4.1-flash',
+  routeLabel({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }))
+check('header: no route has no label',
+  routeLabel(null) === null && routeLabel({ provider: 'x', model: '' }) === null,
+  [routeLabel(null), routeLabel({ provider: 'x', model: '' })])
+check('header: the tooltip carries provider and model',
+  routeTitle({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }) === 'commandcode / deepseek/deepseek-v4.1-flash',
+  routeTitle({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }))
+check('header: a self-naming model does not repeat its provider',
+  routeTitle({ provider: 'deepseek', model: 'deepseek/deepseek-v4.1-flash' }) === 'deepseek/deepseek-v4.1-flash',
+  routeTitle({ provider: 'deepseek', model: 'deepseek/deepseek-v4.1-flash' }))
+
+// Smoke-render the panel: the new composer must not depend on Host state that
+// has not arrived yet. The stub runs effects inline, so polling is muted first.
+const realFetch = globalThis.fetch
+const realSetInterval = globalThis.setInterval
+const realClearInterval = globalThis.clearInterval
+globalThis.fetch = async () => { throw new Error('offline test') }
+globalThis.setInterval = () => 0
+globalThis.clearInterval = () => {}
+const panelTree = body.component({ sessionId: 'sess-1', useTabInfo: () => ({}), t: translate })
+globalThis.fetch = realFetch
+globalThis.setInterval = realSetInterval
+globalThis.clearInterval = realClearInterval
+
+const panel = walk(panelTree)
+check('panel: renders the composer before Host state arrives',
+  panel.tags.includes('form') && panel.tags.includes('textarea'), panel.tags.slice(0, 14))
+const fileInput = renderWalkFind(panelTree, 'input')
+check('panel: offers a hidden image input with the accepted types',
+  fileInput?.props?.type === 'file' && String(fileInput?.props?.accept ?? '').includes('image/png'),
+  fileInput?.props)
+check('panel: the attach control waits for the Host answer',
+  collectByClass(panelTree, 'btw-attach').length === 0, collectByClass(panelTree, 'btw-attach').length)
+
+// A panel whose Host state says images are supported offers the control.
+seedNext = {
+  ok: true, open: true, busy: false, pending: null, error: null, messages: [],
+  totals: { asks: 0 }, tools: { names: [], reason: 'idle' },
+  route: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+  images: { enabled: true, max: 6, reason: 'ok' },
+  limits: { maxExchanges: 20, maxContextMessages: 80, maxContextChars: 48000, maxImages: 6 },
+}
+globalThis.fetch = async () => { throw new Error('offline test') }
+globalThis.setInterval = () => 0
+globalThis.clearInterval = () => {}
+const readyTree = body.component({ sessionId: 'sess-1', useTabInfo: () => ({}), t: translate })
+seedNext = undefined
+globalThis.fetch = realFetch
+globalThis.setInterval = realSetInterval
+globalThis.clearInterval = realClearInterval
+const readyTexts = walk(readyTree).texts.join('|')
+check('panel: the attach control appears once the Host supports images',
+  collectByClass(readyTree, 'btw-attach').length === 1, collectByClass(readyTree, 'btw-attach').length)
+check('panel: the footer explains the request budget',
+  readyTexts.includes('replay ≤20 turns · context ≤80 msgs'), readyTexts.slice(0, 200))
+check('panel: the budget line carries the tooltip',
+  collectByClass(readyTree, 'btw-limits')[0]?.props.title?.includes('48000'), collectByClass(readyTree, 'btw-limits')[0]?.props)
+const routeChip = collectByClass(readyTree, 'btw-route')[0]
+check('panel: the model chip shows the model id, not an ellipsized stub',
+  (routeChip?.children ?? []).join('') === 'deepseek/deepseek-v4.1-flash', (routeChip?.children ?? []).join(''))
+check('panel: the model chip keeps the whole route in its tooltip',
+  routeChip?.props?.title === 'Model: commandcode / deepseek/deepseek-v4.1-flash', routeChip?.props?.title)
+
+// The same panel with image input switched off hides the control entirely.
+seedNext = {
+  ok: true, open: true, busy: false, pending: null, error: null, messages: [],
+  totals: { asks: 0 }, tools: { names: [], reason: 'idle' },
+  images: { enabled: false, max: 0, reason: 'disabled' },
+  limits: { maxExchanges: 20, maxContextMessages: 80, maxContextChars: 48000, maxImages: 0 },
+}
+globalThis.fetch = async () => { throw new Error('offline test') }
+globalThis.setInterval = () => 0
+globalThis.clearInterval = () => {}
+const offTree = body.component({ sessionId: 'sess-1', useTabInfo: () => ({}), t: translate })
+seedNext = undefined
+globalThis.fetch = realFetch
+globalThis.setInterval = realSetInterval
+globalThis.clearInterval = realClearInterval
+check('panel: a deployment without images shows no attach control',
+  collectByClass(offTree, 'btw-attach').length === 0, collectByClass(offTree, 'btw-attach').length)
 
 openNext = true
 const toolsDetail = walk(UsageStrip({
@@ -765,8 +1440,12 @@ check('usage strip: the breakdown names the tools in force',
   toolsDetail.texts.slice(-4))
 openNext = true
 const noToolsDetail = walk(UsageStrip({ totals: stripTotals, t: translate, tools: { names: [], reason: 'disabled' } }))
-check('usage strip: a disabled whitelist is shown as off',
-  noToolsDetail.texts.includes('off'), noToolsDetail.texts.slice(-4))
+check('usage strip: a disabled whitelist names its reason',
+  noToolsDetail.texts.includes('off (empty whitelist)'), noToolsDetail.texts.slice(-4))
+openNext = true
+const notAdmitted = walk(UsageStrip({ totals: stripTotals, t: translate, tools: { names: [], reason: 'not-admitted' } }))
+check('usage strip: a session that grants no tools says which reason',
+  notAdmitted.texts.includes('off (not granted to this session)'), notAdmitted.texts.slice(-4))
 
 /** Find the first element with one tag in a built tree. */
 function renderWalkFind(node, tag) {

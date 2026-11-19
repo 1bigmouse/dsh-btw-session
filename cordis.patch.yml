@@ -1,5 +1,5 @@
 # Btw side session: one Host row that registers the side-question service,
-# the `/btw` command, and the three Fetch routes the right-sidebar panel uses.
+# the `/btw` command, and the four Fetch routes the right-sidebar panel uses.
 - insert:
     - id: btw-session
       name: 'dsh-btw-session'
@@ -7,6 +7,13 @@
         maxExchanges: 20
         maxContextMessages: 80
         maxContextChars: 48000
+        # Screenshots already sent in this conversation that a side answer may
+        # look at again, newest first. 0 leaves only the text placeholder.
+        maxContextImages: 3
+        # Images one side question may attach; 0 turns image input off.
+        maxImages: 6
+        # Image occurrences kept across one whole request, newest first.
+        maxRequestImages: 8
         maxOutputTokens: 8192
         # Read-only lookups a side answer may run. Remove the list to answer from
         # context alone; mutating tools are never offered.
@@ -15,3 +22,5 @@
           - glob
           - grep
         maxToolRounds: 4
+        # Wall-clock budget for one answer in milliseconds; 0 disables the timer.
+        timeoutMs: 300000
